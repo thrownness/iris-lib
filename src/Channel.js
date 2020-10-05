@@ -93,38 +93,10 @@ class Channel {
     this.ourSecretChannelIds = {}; // maps participant public key to our secret mutual channel id
     this.theirSecretChannelIds = {}; // maps participant public key to their secret mutual channel id
     this.messages = {};
+    this.chatLinks = {};
 
-    let saved;
     if (options.chatLink) {
-      const s = options.chatLink.split('?');
-      if (s.length === 2) {
-        const pub = util.getUrlParameter('chatWith', s[1]);
-        const channelId = util.getUrlParameter('channelId', s[1]);
-        const inviter = util.getUrlParameter('inviter', s[1]);
-        if (pub) {
-          options.participants = pub;
-          if (pub !== this.key.pub) {
-            const sharedSecret = util.getUrlParameter('s', s[1]);
-            const linkId = util.getUrlParameter('k', s[1]);
-            if (sharedSecret && linkId) {
-              this.save(); // save the channel first so it's there before inviter subscribes to it
-              saved = true;
-              this.gun.user(pub).get('chatLinks').get(linkId).get('encryptedSharedKey').on(async encrypted => {
-                const sharedKey = await Gun.SEA.decrypt(encrypted, sharedSecret);
-                const encryptedChatRequest = await Gun.SEA.encrypt(this.key.pub, sharedSecret); // TODO encrypt is not deterministic, it uses salt
-                const channelRequestId = await util.getHash(encryptedChatRequest);
-                util.gunAsAnotherUser(this.gun, sharedKey, user => {
-                  user.get('chatRequests').get(channelRequestId.slice(0, 12)).put(encryptedChatRequest);
-                });
-              });
-            }
-          }
-        } else if (channelId && inviter && inviter !== this.key.pub) { // TODO! initializing it twice breaks things - new secret is generated
-          options.uuid = channelId;
-          options.participants = {};
-          options.participants[inviter] = Object.assign({inviter: true}, this.DEFAULT_PERMISSIONS);
-        }
-      }
+      this.useChatLink(options);
     }
 
     if (typeof options.participants === `string`) {
@@ -142,7 +114,7 @@ class Channel {
         }
       });
       options.participants[this.key.pub] = options.participants[this.key.pub] || Object.assign({}, this.DEFAULT_PERMISSIONS);
-      if (options.uuid) { // It's a group channel
+      if (options.uuid) {
         this.uuid = options.uuid;
         this.name = options.name;
       } else {
@@ -151,6 +123,7 @@ class Channel {
         options.participants[this.key.pub].admin = true;
         options.participants[this.key.pub].founder = true;
       }
+      this.getChatLinks({subscribe: true});
     }
     this.participants = options.participants;
     if (options.uuid) { // It's a group channel
@@ -193,12 +166,45 @@ class Channel {
               this.addParticipant(k, true, Object.assign({}, this.DEFAULT_PERMISSIONS, participants[k]));
             }
           });
-          saved = true;
+          options.saved = true;
         }
       }
     });
-    if (!saved && (options.save === undefined || options.save === true)) {
+    if (!options.saved && (options.save === undefined || options.save === true)) {
       this.save();
+    }
+  }
+
+  useChatLink(options) {
+    const s = options.chatLink.split('?');
+    if (s.length === 2) {
+      const chatWith = util.getUrlParameter('chatWith', s[1]);
+      const channelId = util.getUrlParameter('channelId', s[1]);
+      const inviter = util.getUrlParameter('inviter', s[1]);
+      const pub = inviter || chatWith;
+      if (chatWith) {
+        options.participants = pub;
+      } else if (channelId && inviter && inviter !== this.key.pub) { // TODO! initializing it twice breaks things - new secret is generated
+        options.uuid = channelId;
+        options.participants = {};
+        options.participants[inviter] = Object.assign({inviter: true}, this.DEFAULT_PERMISSIONS);
+      }
+      if (pub !== this.key.pub) {
+        const sharedSecret = util.getUrlParameter('s', s[1]);
+        const linkId = util.getUrlParameter('k', s[1]);
+        if (sharedSecret && linkId) {
+          this.save(); // save the channel first so it's there before inviter subscribes to it
+          options.saved = true;
+          this.gun.user(pub).get('chatLinks').get(linkId).get('encryptedSharedKey').on(async encrypted => {
+            const sharedKey = await Gun.SEA.decrypt(encrypted, sharedSecret);
+            const encryptedChatRequest = await Gun.SEA.encrypt(this.key.pub, sharedSecret); // TODO encrypt is not deterministic, it uses salt
+            const channelRequestId = await util.getHash(encryptedChatRequest);
+            util.gunAsAnotherUser(this.gun, sharedKey, user => {
+              user.get('chatRequests').get(channelRequestId.slice(0, 12)).put(encryptedChatRequest);
+            });
+          });
+        }
+      }
     }
   }
 
@@ -412,7 +418,7 @@ class Channel {
   }
 
   async messageReceived(callback, data, channelId, selfAuthored, key, from) {
-    if (this.messages[key]) {
+    if (this.messages[key] || !data) {
       return;
     }
     const secret = this.uuid ? (await this.getTheirGroupSecret(from)) : (await this.getSecret(channelId));
@@ -432,6 +438,7 @@ class Channel {
     const callbackIfLatest = async (msg, info) => {
       if (!this.latest) {
         this.latest = msg;
+        callback(msg, info);
       } else {
         const t = (typeof this.latest.time === `string` ? this.latest.time : this.latest.time.toISOString());
         if (t < msg.time) {
@@ -440,8 +447,8 @@ class Channel {
         }
       }
     };
-    this.onMy('latestMsg', msg => callbackIfLatest(msg, {selfAuthored: true}));
-    this.onTheir('latestMsg', msg => callbackIfLatest(msg, {selfAuthored: false}));
+    this.onMy('latestMsg', msg => callbackIfLatest(msg, {selfAuthored: true, from: this.key.pub}));
+    this.onTheir('latestMsg', (msg, k, from) => callbackIfLatest(msg, {selfAuthored: false, from}));
   }
 
   /**
@@ -704,7 +711,7 @@ class Channel {
   setTyping(isTyping, timeout = 5) {
     isTyping = typeof isTyping === `undefined` ? true : isTyping;
     timeout = timeout * 1000;
-    this.put(`typing`, isTyping ? new Date().toISOString() : false);
+    this.put(`typing`, isTyping ? new Date().toISOString() : new Date(0).toISOString());
     clearTimeout(this.setTypingTimeout);
     this.setTypingTimeout = setTimeout(() => this.put(`typing`, false), timeout);
   }
@@ -766,6 +773,62 @@ class Channel {
     } else {
       return `${urlRoot}?chatWith=${this.getCurrentParticipants()[0]}`;
     }
+  }
+
+  /**
+  *
+  */
+  async getChatLinks({callback, urlRoot, subscribe}) {
+    urlRoot = urlRoot || 'https://iris.to/';
+    if (!this.uuid) { throw new Error('Only group channels may have chat links'); }
+    const chatLinks = [];
+    this.on('chatLinks', (links, from) => {
+      // TODO: check admin permissions
+      if (!links || typeof links !== 'object') { return; }
+      Object.keys(links).forEach(linkId => {
+        const link = links[linkId];
+        if (chatLinks.indexOf(linkId) !== -1) { return; } // TODO: check if link was nulled
+        const channels = [];
+        chatLinks.push(linkId);
+        const url = Channel.formatChatLink({urlRoot, inviter: from, channelId: this.uuid, sharedSecret: link.sharedSecret, linkId});
+        if (callback) {
+          callback({url, id: linkId});
+        }
+        if (subscribe) {
+          this.gun.user(link.sharedKey.pub).get('chatRequests').map().on(async (encPub, requestId) => {
+            if (!encPub || typeof encPub !== 'string' || encPub.length < 10) { return; }
+            const s = JSON.stringify(encPub);
+            if (channels.indexOf(s) === -1) {
+              channels.push(s);
+              const pub = await Gun.SEA.decrypt(encPub, link.sharedSecret);
+              this.addParticipant(pub);
+            }
+          });
+        }
+      });
+    });
+  }
+
+  async createChatLink(urlRoot = 'https://iris.to/') {
+    const sharedKey = await Gun.SEA.pair();
+    const sharedKeyString = JSON.stringify(sharedKey);
+    const sharedSecret = await Gun.SEA.secret(sharedKey.epub, sharedKey);
+    const encryptedSharedKey = await Gun.SEA.encrypt(sharedKeyString, sharedSecret);
+    const ownerSecret = await Gun.SEA.secret(this.key.epub, this.key);
+    const ownerEncryptedSharedKey = await Gun.SEA.encrypt(sharedKeyString, ownerSecret);
+    let linkId = await util.getHash(encryptedSharedKey);
+    linkId = linkId.slice(0, 12);
+
+    // User has to exist, in order for .get(chatRequests).on() to be ever triggered
+    await util.gunAsAnotherUser(this.gun, sharedKey, user => {
+      return user.get('chatRequests').put({a: 1}).then();
+    });
+
+    this.chatLinks[linkId] = {sharedKey, sharedSecret};
+    this.put('chatLinks', this.chatLinks);
+    this.user.get('chatLinks').get(linkId).put({encryptedSharedKey, ownerEncryptedSharedKey});
+
+    return Channel.formatChatLink({urlRoot, channelId: this.uuid, inviter: this.key.pub, sharedSecret, linkId});
   }
 
   /**
@@ -832,8 +895,8 @@ class Channel {
     if (participants.length) {
       const pub = participants[0];
       this.gun.user(pub).get('profile').get('name').on(name => nameEl.innerText = name);
-      Channel.getOnline(this.gun, pub, status => {
-        const cls = `iris-online-indicator${  status.isOnline ? ' yes' : ''}`;
+      Channel.getActivity(this.gun, pub, status => {
+        const cls = `iris-online-indicator${  status.isActive ? ' yes' : ''}`;
         onlineIndicator.setAttribute('class', cls);
         const undelivered = messages.querySelectorAll('.iris-chat-message:not(.delivered)');
         undelivered.forEach(msg => {
@@ -889,7 +952,7 @@ class Channel {
     });
 
     textArea.addEventListener('keyup', event => {
-      Channel.setOnline(this.gun, true); // TODO
+      Channel.setActivity(this.gun, true); // TODO
       this.setMyMsgsLastSeenTime(); // TODO
       if (event.keyCode === 13) {
         event.preventDefault();
@@ -912,21 +975,24 @@ class Channel {
   }
 
   /**
-  * Set the user's online status
+  * Set the user's online/active status
   * @param {object} gun
-  * @param {boolean} isOnline true: update the user's lastActive time every 3 seconds, false: stop updating
+  * @param {string} activity string: set the activity status every 3 seconds, null/false: stop updating
   */
-  static setOnline(gun, isOnline) {
-    if (isOnline) {
-      if (gun.setOnlineInterval) { return; }
-      const update = () => {
-        gun.user().get(`lastActive`).put(new Date(Gun.state()).toISOString());
-      };
-      update();
-      gun.setOnlineInterval = setInterval(update, 3000);
-    } else {
-      clearInterval(gun.setOnlineInterval);
-      gun.setOnlineInterval = undefined;
+  static setActivity(gun, activity) {
+    if (gun.irisActivityStatus === activity) { return; }
+    gun.irisActivityStatus = activity;
+    clearTimeout(gun.setActivityTimeout);
+    const update = () => {
+      gun.user().get(`activity`).put({status: activity, time: new Date(Gun.state()).toISOString()});
+    };
+    update();
+    if (activity) {
+      function timerUpdate() {
+        update();
+        gun.setActivityTimeout = setTimeout(timerUpdate, 3000);
+      }
+      timerUpdate();
     }
   }
 
@@ -937,20 +1003,17 @@ class Channel {
   * @param {string} pubKey public key of the user
   * @param {boolean} callback receives a boolean each time the user's online status changes
   */
-  static getOnline(gun, pubKey, callback) {
+  static getActivity(gun, pubKey, callback) {
     let timeout;
-    gun.user(pubKey).get(`lastActive`).on(lastActive => {
+    gun.user(pubKey).get(`activity`).on(activity => {
+      if (!activity || !(activity.time && activity.status)) { return; }
       clearTimeout(timeout);
       const now = new Date(Gun.state());
-      let lastActiveDate = new Date(lastActive);
-      if (lastActiveDate.getFullYear() === 1970) { // lol, format changed from seconds to iso string
-        lastActiveDate = new Date(lastActiveDate.getTime() * 1000);
-        lastActive = lastActiveDate.toISOString();
-      }
-      const isOnline = lastActiveDate > now - 10 * 1000 && lastActive < now + 30 * 1000;
-      callback({isOnline, lastActive});
-      if (isOnline) {
-        timeout = setTimeout(() => callback({isOnline: false, lastActive}), 10000);
+      const activityDate = new Date(activity.time);
+      const isActive = activityDate > new Date(now.getTime() - 10 * 1000) && activityDate < new Date(now.getTime() + 30 * 1000);
+      callback({isActive, lastActive: activity.time, status: activity.status});
+      if (isActive) {
+        timeout = setTimeout(() => callback({isOnline: false, lastActive: activity.time}), 10000);
       }
     });
   }
@@ -971,8 +1034,13 @@ class Channel {
     user.put({epub: key.epub});
   }
 
-  static formatChatLink(urlRoot, pub, sharedSecret, linkId) {
-    return `${urlRoot}?chatWith=${encodeURIComponent(pub)}&s=${encodeURIComponent(sharedSecret)}&k=${encodeURIComponent(linkId)}`;
+  static formatChatLink({urlRoot, chatWith, channelId, inviter, sharedSecret, linkId}) {
+    const enc = encodeURIComponent;
+    if (channelId && inviter) {
+      return `${urlRoot}?channelId=${enc(channelId)}&inviter=${enc(inviter)}&s=${enc(sharedSecret)}&k=${enc(linkId)}`;
+    } else {
+      return `${urlRoot}?chatWith=${enc(chatWith)}&s=${enc(sharedSecret)}&k=${enc(linkId)}`;
+    }
   }
 
   /**
@@ -998,7 +1066,7 @@ class Channel {
 
     user.get('chatLinks').get(linkId).put({encryptedSharedKey, ownerEncryptedSharedKey});
 
-    return Channel.formatChatLink(urlRoot, key.pub, sharedSecret, linkId);
+    return Channel.formatChatLink({urlRoot, chatWith: key.pub, sharedSecret, linkId});
   }
 
   /**
@@ -1017,7 +1085,7 @@ class Channel {
         chatLinks.push(linkId);
         const sharedKey = await Gun.SEA.decrypt(enc, mySecret);
         const sharedSecret = await Gun.SEA.secret(sharedKey.epub, sharedKey);
-        const url = Channel.formatChatLink(urlRoot, key.pub, sharedSecret, linkId);
+        const url = Channel.formatChatLink({urlRoot, chatWith: key.pub, sharedSecret, linkId});
         if (callback) {
           callback({url, id: linkId});
         }
